@@ -20,22 +20,23 @@ def _archive(path, version, *, bad_path=False):
         package.writestr(f'{root}/collector-release.json', json.dumps(manifest))
         if bad_path:
             package.writestr(f'{root}/../outside.txt', b'bad')
-    return ReleasePlan(version, 'v'+version, 123, path.stat().st_size, sha256(path))
+    return ReleasePlan(version, 'v'+version, path.stat().st_size, sha256(path),
+                       manifest['executable_sha256'])
 
 
 def test_release_selection_requires_newer_stable_digest():
     assert version_tuple('v0.6.1') > version_tuple('0.6.0')
     with pytest.raises(ValueError):
         version_tuple('0.6.1rc1')
-    asset = {'id': 7, 'name': 'SynaerisCollector-Human-0.6.1.zip',
-        'state': 'uploaded', 'size': 42, 'digest': 'sha256:'+'a'*64}
-    release = {'tag_name': 'v0.6.1', 'draft': False, 'prerelease': False,
-        'assets': [asset]}
+    release = {'schema': 'synaeris-collector-update-v1', 'version': '0.6.1',
+        'tag': 'v0.6.1', 'asset_name': 'SynaerisCollector-Human-0.6.1.zip',
+        'archive_size': 42, 'archive_sha256': 'a'*64, 'executable_sha256': 'b'*64}
     assert select_release(release, current='0.6.0').sha256 == 'a'*64
     assert select_release(release, current='0.6.1') is None
-    assert select_release(dict(release, prerelease=True), current='0.6.0') is None
+    with pytest.raises(ValueError, match='tag disagree'):
+        select_release(dict(release, tag='v0.6.2'), current='0.6.0')
     with pytest.raises(ValueError, match='SHA-256'):
-        select_release(dict(release, assets=[dict(asset, digest=None)]), current='0.6.0')
+        select_release(dict(release, archive_sha256=None), current='0.6.0')
 
 
 def test_verified_update_stages_outside_recordings_and_activates_on_next_launch(tmp_path):
@@ -64,7 +65,7 @@ def test_update_rejects_path_traversal_and_does_not_publish_pointer(tmp_path):
 def test_update_rejects_archive_digest_mismatch(tmp_path):
     archive = tmp_path/'test.zip'
     plan = _archive(archive, '0.6.1')
-    plan = ReleasePlan(plan.version, plan.tag, plan.asset_id, plan.size, '0'*64)
+    plan = ReleasePlan(plan.version, plan.tag, plan.size, '0'*64, plan.executable_sha256)
     with pytest.raises(ValueError, match='SHA-256'):
         stage_release(plan, root=tmp_path/'updates',
             downloader=lambda _, target: shutil.copyfile(archive, target))

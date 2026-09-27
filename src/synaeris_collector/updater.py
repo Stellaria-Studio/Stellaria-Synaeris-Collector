@@ -48,36 +48,33 @@ def sha256(path):
 class ReleasePlan:
     version: str
     tag: str
-    asset_id: int
     size: int
     sha256: str
+    executable_sha256: str
 
 
 def select_release(metadata, *, current=APP_VERSION):
-    if metadata.get('draft') or metadata.get('prerelease'):
-        return None
-    tag = metadata.get('tag_name', '')
-    version = tag.removeprefix('v')
+    if metadata.get('schema') != 'synaeris-collector-update-v1':
+        raise ValueError('Unknown Collector update manifest')
+    version = metadata.get('version', '')
+    tag = metadata.get('tag', '')
+    if tag != 'v'+version:
+        raise ValueError('Update version and tag disagree')
     if version_tuple(version) <= version_tuple(current):
         return None
     expected = f'SynaerisCollector-Human-{version}.zip'
-    matches = [asset for asset in metadata.get('assets', [])
-               if asset.get('name') == expected and asset.get('state') == 'uploaded']
-    if len(matches) != 1:
-        raise ValueError('Release has no unique Collector archive')
-    asset = matches[0]
-    digest = asset.get('digest') or ''
-    if not digest.startswith('sha256:') or len(digest) != 71:
-        raise ValueError('Release archive has no SHA-256 digest')
-    hex_digest = digest[7:]
-    if any(char not in '0123456789abcdefABCDEF' for char in hex_digest):
-        raise ValueError('Release archive digest is malformed')
-    size = asset.get('size')
-    asset_id = asset.get('id')
-    if (not isinstance(size, int) or not 0 < size <= MAX_ARCHIVE_BYTES
-            or not isinstance(asset_id, int) or asset_id <= 0):
+    if metadata.get('asset_name') != expected:
+        raise ValueError('Update archive name is invalid')
+    digest = metadata.get('archive_sha256', '')
+    executable_digest = metadata.get('executable_sha256', '')
+    for value in (digest, executable_digest):
+        if not isinstance(value, str) or len(value) != 64 or any(
+                char not in '0123456789abcdefABCDEF' for char in value):
+            raise ValueError('Update SHA-256 digest is malformed')
+    size = metadata.get('archive_size')
+    if not isinstance(size, int) or not 0 < size <= MAX_ARCHIVE_BYTES:
         raise ValueError('Release archive metadata is invalid')
-    return ReleasePlan(version, tag, asset_id, size, hex_digest.lower())
+    return ReleasePlan(version, tag, size, digest.lower(), executable_digest.lower())
 
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -104,17 +101,22 @@ def _headers(accept):
 
 
 def latest_release():
-    url = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
+    url = f'https://github.com/{REPOSITORY}/releases/latest/download/collector-update.json'
     request = urllib.request.Request(url,
-        headers=_headers('application/vnd.github+json'))
+        headers={**_headers('application/json'), 'Cache-Control': 'no-cache'})
     with _opener().open(request, timeout=20) as response:
         if response.status != 200:
             raise RuntimeError(f'GitHub update check returned HTTP {response.status}')
-        return json.load(response)
+        if int(response.headers.get('Content-Length') or 0) > 16_384:
+            raise ValueError('Update manifest exceeds size limit')
+        payload = response.read(16_385)
+        if len(payload) > 16_384:
+            raise ValueError('Update manifest exceeds size limit')
+        return json.loads(payload)
 
 
 def download_release(plan, destination):
-    url = f'https://api.github.com/repos/{REPOSITORY}/releases/assets/{plan.asset_id}'
+    url = f'https://github.com/{REPOSITORY}/releases/download/{plan.tag}/SynaerisCollector-Human-{plan.version}.zip'
     request = urllib.request.Request(url,
         headers=_headers('application/octet-stream'))
     count = 0
@@ -181,6 +183,8 @@ def stage_release(plan, *, root=None, downloader=None):
                 raise ValueError('Update archive size or SHA-256 mismatch')
         payload = _safe_extract(archive, temporary/'unpacked', plan.version)
         exe_digest = sha256(payload/EXE_NAME)
+        if exe_digest != plan.executable_sha256:
+            raise ValueError('Update executable SHA-256 mismatch')
         if not target.exists():
             os.replace(payload, target)
         elif sha256(target/EXE_NAME) != exe_digest:

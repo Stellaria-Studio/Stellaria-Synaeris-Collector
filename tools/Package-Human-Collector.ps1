@@ -1,4 +1,4 @@
-param([string]$Version = '0.6.0')
+param([string]$Version = '0.6.1')
 $ErrorActionPreference = 'Stop'
 $collectorRoot = Split-Path -Parent $PSScriptRoot
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid package version' }
@@ -18,8 +18,15 @@ $collectorExecutableHash = (Get-FileHash -LiteralPath (Join-Path $collectorRelea
     Set-Content -LiteralPath (Join-Path $collectorRelease 'collector-release.json') -Encoding UTF8
 # Include one containing directory so extracting does not scatter runtime files.
 Compress-Archive -LiteralPath $collectorRelease -DestinationPath $collectorZip -CompressionLevel Optimal
+$collectorArchiveInfo = Get-Item -LiteralPath $collectorZip
+$collectorArchiveHash = (Get-FileHash -LiteralPath $collectorZip).Hash.ToLowerInvariant()
+@{schema='synaeris-collector-update-v1';version=$Version;tag=('v'+$Version);
+  asset_name=('SynaerisCollector-Human-'+$Version+'.zip');
+  archive_size=$collectorArchiveInfo.Length;archive_sha256=$collectorArchiveHash;
+  executable_sha256=$collectorExecutableHash} | ConvertTo-Json |
+    Set-Content -LiteralPath (Join-Path $collectorRoot 'dist/releases/collector-update.json') -Encoding UTF8
 @{version=$Version;software_directory=$collectorRelease;archive=$collectorZip;
-  archive_sha256=(Get-FileHash -LiteralPath $collectorZip).Hash;
+  archive_sha256=$collectorArchiveHash;
   executable_sha256=$collectorExecutableHash} |
     ConvertTo-Json | Set-Content -LiteralPath ($collectorRelease+'.manifest.json') -Encoding UTF8
 Write-Output $collectorZip
