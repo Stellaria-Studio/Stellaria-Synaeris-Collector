@@ -1,0 +1,16 @@
+.venv/
+.packenv/
+.external/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+data/
+reports/local/
+config.local.json
+*.spec
+*.log
+bin/
+obj/
+config/*.local.json

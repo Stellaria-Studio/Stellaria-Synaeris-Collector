@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stellaria-synaeris-collector"
+version = "0.6.0"
+description = "Evidence-preserving Genshin gameplay recorder and semantic compiler for Synaeris"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "numpy>=2,<3", "opencv-python>=4.10,<5", "pyarrow>=19,<24",
+  "psutil>=6,<8", "Pillow>=11,<13", "mss>=10,<11",
+  "rapidocr>=3.9,<4", "onnxruntime>=1.20,<2", "imageio-ffmpeg>=0.6,<0.7",
+  "pynput>=1.8,<2; sys_platform == 'win32'",
+  "dxcam>=0.3,<0.4; sys_platform == 'win32'",
+  "windows-capture==2.0.1; sys_platform == 'win32'"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pyinstaller>=6,<7"]
+
+[project.scripts]
+synaeris-collector = "synaeris_collector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

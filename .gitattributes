@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+# Patch context retains upstream whitespace verbatim.
+*.patch text eol=lf -whitespace
