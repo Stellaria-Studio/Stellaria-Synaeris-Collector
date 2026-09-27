@@ -19,6 +19,7 @@ from .version import APP_VERSION, REPOSITORY
 MAX_ARCHIVE_BYTES = 1_000_000_000
 MAX_EXPANDED_BYTES = 2_000_000_000
 MAX_FILES = 20_000
+DOWNLOAD_CHUNK_BYTES = 4*1024*1024
 EXE_NAME = 'SynaerisCollector.exe'
 
 
@@ -117,20 +118,37 @@ def latest_release():
 
 def download_release(plan, destination):
     url = f'https://github.com/{REPOSITORY}/releases/download/{plan.tag}/SynaerisCollector-Human-{plan.version}.zip'
-    request = urllib.request.Request(url,
-        headers=_headers('application/octet-stream'))
-    count = 0
-    with _opener().open(request, timeout=30) as response, Path(destination).open('wb') as stream:
-        if response.status != 200:
-            raise RuntimeError(f'GitHub asset download returned HTTP {response.status}')
-        if response.headers.get_content_type() == 'application/json':
-            raise RuntimeError('GitHub returned asset metadata instead of ZIP bytes')
-        while block := response.read(1024*1024):
-            count += len(block)
-            if count > MAX_ARCHIVE_BYTES or count > plan.size:
-                raise ValueError('Update archive exceeds declared size')
-            stream.write(block)
-    if count != plan.size or sha256(destination) != plan.sha256:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    count = destination.stat().st_size if destination.exists() else 0
+    if count > plan.size or (count == plan.size and sha256(destination) != plan.sha256):
+        destination.write_bytes(b'')
+        count = 0
+    if count == plan.size:
+        return
+    with destination.open('ab') as stream:
+        while count < plan.size:
+            end = min(count+DOWNLOAD_CHUNK_BYTES, plan.size)-1
+            request = urllib.request.Request(url,
+                headers={**_headers('application/octet-stream'),
+                         'Range': f'bytes={count}-{end}'})
+            with _opener().open(request, timeout=30) as response:
+                if (response.status != 206 or response.headers.get('Content-Range')
+                        != f'bytes {count}-{end}/{plan.size}'):
+                    raise ValueError('GitHub asset returned a different byte range')
+                if response.headers.get_content_type() == 'application/json':
+                    raise RuntimeError('GitHub returned asset metadata instead of ZIP bytes')
+                length = end-count+1
+                chunk = bytearray()
+                while len(chunk) < length:
+                    block = response.read(min(64*1024, length-len(chunk)))
+                    if not block:
+                        raise RuntimeError('GitHub asset download ended mid-range')
+                    chunk.extend(block)
+            stream.write(chunk)
+            stream.flush()
+            count += length
+    if sha256(destination) != plan.sha256:
         raise ValueError('Update archive size or SHA-256 mismatch')
 
 
@@ -169,12 +187,14 @@ def stage_release(plan, *, root=None, downloader=None):
     root = Path(root or update_root()).resolve()
     versions = root/'versions'
     versions.mkdir(parents=True, exist_ok=True)
+    downloads = root/'downloads'
+    downloads.mkdir(parents=True, exist_ok=True)
     target = versions/f'{plan.version}-{plan.sha256[:12]}'
     temporary = Path(tempfile.mkdtemp(prefix='staging-', dir=root)).resolve()
     if not temporary.is_relative_to(root):
         raise ValueError('Update staging escaped its root')
     try:
-        archive = temporary/'release.zip'
+        archive = downloads/f'{plan.version}-{plan.sha256[:12]}.zip.partial'
         if downloader is None:
             download_release(plan, archive)
         else:

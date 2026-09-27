@@ -1,11 +1,14 @@
 import json
+from email.message import Message
+import hashlib
+import io
 from pathlib import Path
 import shutil
 import zipfile
 
 import pytest
 
-from synaeris_collector.updater import (ReleasePlan, newer_local_executable,
+from synaeris_collector.updater import (ReleasePlan, download_release, newer_local_executable,
     select_release, sha256, stage_release, version_tuple)
 from synaeris_collector.version import REPOSITORY
 
@@ -69,3 +72,29 @@ def test_update_rejects_archive_digest_mismatch(tmp_path):
     with pytest.raises(ValueError, match='SHA-256'):
         stage_release(plan, root=tmp_path/'updates',
             downloader=lambda _, target: shutil.copyfile(archive, target))
+
+
+def test_download_resumes_verified_http_ranges(monkeypatch, tmp_path):
+    payload = b'x' * (5*1024*1024+13)
+    path = tmp_path/'release.zip.partial'
+    path.write_bytes(payload[:1024])
+    seen = []
+
+    class Opener:
+        def open(self, request, timeout):
+            start, end = map(int, request.get_header('Range')[6:].split('-'))
+            seen.append((start, end))
+            response = io.BytesIO(payload[start:end+1])
+            response.status = 206
+            response.headers = Message()
+            response.headers['Content-Range'] = f'bytes {start}-{end}/{len(payload)}'
+            response.headers['Content-Type'] = 'application/octet-stream'
+            return response
+
+    monkeypatch.setattr('synaeris_collector.updater._opener', lambda: Opener())
+    plan = ReleasePlan('0.6.2', 'v0.6.2', len(payload),
+                       hashlib.sha256(payload).hexdigest(), 'a'*64)
+    download_release(plan, path)
+    assert path.read_bytes() == payload
+    assert seen == [(1024, 4*1024*1024+1023),
+                    (4*1024*1024+1024, len(payload)-1)]
