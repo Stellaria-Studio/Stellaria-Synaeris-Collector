@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stellaria-synaeris-collector"
-version = "0.6.0"
+dynamic = ["version"]
 description = "Evidence-preserving Genshin gameplay recorder and semantic compiler for Synaeris"
 requires-python = ">=3.11,<3.15"
 dependencies = [
@@ -24,6 +24,9 @@ synaeris-collector = "synaeris_collector.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "synaeris_collector.version.APP_VERSION"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

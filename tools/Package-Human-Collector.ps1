@@ -1,4 +1,4 @@
-param([string]$Version = '0.6.2')
+param([string]$Version = '0.6.3')
 $ErrorActionPreference = 'Stop'
 $collectorRoot = Split-Path -Parent $PSScriptRoot
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid package version' }
