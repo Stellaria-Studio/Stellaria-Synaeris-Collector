@@ -16,7 +16,11 @@
       "Never delete live recordings automatically; stage updates outside data directories."
     ],
     "implementationPaths": [
-      "src"
+      "src",
+      "Start-BGI-Telemetry.ps1",
+      "Start-Collector.ps1",
+      "Start-Live-Collection.ps1",
+      "collector_app.py"
     ],
     "dependsOn": [],
     "acceptanceGates": [
