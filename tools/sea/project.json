@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "name": "Stellaria-Synaeris-Collector",
+  "components": {
+    "project": {
+      "description": "Windows gameplay evidence collector for Stellaria Synaeris",
+      "paths": [
+        "src"
+      ],
+      "approved": [
+        "README.md"
+      ],
+      "required_files": [
+        "README.md"
+      ],
+      "build_targets": [],
+      "validation": [],
+      "pitfalls": [
+        "Keep model topology, training, private routes and gameplay data outside this public repository.",
+        "Preserve mother video/event streams and uncertainty; derived labels do not become verified game outcomes.",
+        "Never delete live recordings automatically; stage updates outside data directories."
+      ],
+      "evidence": []
+    }
+  },
+  "build_metadata": [
+    "pyproject.toml"
+  ]
+}

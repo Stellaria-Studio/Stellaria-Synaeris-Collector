@@ -1,0 +1,37 @@
+{
+  "schema": "stellaria.sea.project.v2",
+  "id": "Stellaria-Studio/Stellaria-Synaeris-Collector",
+  "name": "Stellaria-Synaeris-Collector",
+  "repository": "Stellaria-Studio/Stellaria-Synaeris-Collector",
+  "defaultBranch": "main",
+  "tier": "C",
+  "profile": "knowledge-runtime",
+  "purpose": "Windows gameplay evidence collector for Stellaria Synaeris",
+  "visibility": "public",
+  "concepts": ".sea/concepts.json",
+  "invariants": [
+    "Keep model topology, training, private routes and gameplay data outside this public repository.",
+    "Preserve mother video/event streams and uncertainty; derived labels do not become verified game outcomes.",
+    "Never delete live recordings automatically; stage updates outside data directories."
+  ],
+  "runtime": {
+    "repository": "Stellaria-Studio/Stellaria-SEA",
+    "version": "2.0.0",
+    "protocol": 2,
+    "sourceCommit": "6207b585ffabb8d182432bb3a03ba4d0a5279aa6"
+  },
+  "legacy": {
+    "definition": "tools/sea/project.json",
+    "history": "read-only; preserve original bytes"
+  },
+  "features": {
+    "contextBroker": true,
+    "architectureRegistry": true,
+    "localTaskCapsules": true,
+    "identityBinding": false,
+    "approvalWorkflow": false,
+    "enforcement": false,
+    "automaticPush": false
+  },
+  "sourceBaseline": "6ebf22e21fc9bf7ed7202ce444ffe020b4eba9b4"
+}

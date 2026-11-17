@@ -1,0 +1,35 @@
+[
+  {
+    "id": "project-architecture",
+    "name": "Stellaria-Synaeris-Collector architecture",
+    "aliases": [
+      "Stellaria-Synaeris-Collector",
+      "Synaeris-Collector",
+      "架构",
+      "职责"
+    ],
+    "intent": "Windows gameplay evidence collector for Stellaria Synaeris",
+    "qualification": "DECLARED_PROJECT_KNOWLEDGE",
+    "invariants": [
+      "Keep model topology, training, private routes and gameplay data outside this public repository.",
+      "Preserve mother video/event streams and uncertainty; derived labels do not become verified game outcomes.",
+      "Never delete live recordings automatically; stage updates outside data directories."
+    ],
+    "implementationPaths": [
+      "src"
+    ],
+    "dependsOn": [],
+    "acceptanceGates": [
+      "source identity",
+      "declared validation is not execution evidence"
+    ],
+    "sources": [
+      {
+        "path": "README.md",
+        "line": 1,
+        "commit": "6ebf22e21fc9bf7ed7202ce444ffe020b4eba9b4"
+      }
+    ],
+    "validation": []
+  }
+]
