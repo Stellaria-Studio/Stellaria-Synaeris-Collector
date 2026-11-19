@@ -11,8 +11,10 @@ ALLOWED = {"pose", "ui", "objects", "quest", "tools", "events", "ocr", "input"}
 
 class TelemetryBridge:
     """Read-only loopback sink. Never sends game input or executes commands."""
-    def __init__(self, writer, port, on_state=None):
+    def __init__(self, writer, port, on_state=None, *, allow_input=True, allow_ocr=True):
         self.writer = writer
+        self.disabled_streams = frozenset(
+            stream for stream, allowed in (("input", allow_input), ("ocr", allow_ocr)) if not allowed)
         self.token = secrets.token_urlsafe(24)
         self.on_state = on_state or (lambda stream, kind, data: None)
         self.latest_pose = None
@@ -113,6 +115,8 @@ class TelemetryBridge:
         stream = item["stream"]
         if stream not in ALLOWED:
             raise ValueError("stream not allowed")
+        if stream in self.disabled_streams:
+            raise ValueError(f"{stream} capture disabled")
         data = item.get("payload", {})
         if not isinstance(data, dict):
             raise ValueError("payload must be object")
@@ -194,6 +198,9 @@ class TelemetryBridge:
 
     def close(self):
         self.closing.set()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=3)
+        try:
+            if self.thread.ident is not None:
+                self.server.shutdown()
+                self.thread.join(timeout=3)
+        finally:
+            self.server.server_close()

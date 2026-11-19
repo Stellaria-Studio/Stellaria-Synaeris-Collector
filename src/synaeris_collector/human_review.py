@@ -7,6 +7,7 @@ import subprocess
 
 import cv2
 import numpy as np
+from .config import capture_source_status
 from .storage import atomic_json, iter_rows
 
 def percentiles(values):
@@ -69,6 +70,8 @@ def review(path, output):
     if index:
         for span in index['segments']:
             scene_seconds[span['scene']] += (span['end_ns']-span['start_ns'])/1e9
+    input_status = capture_source_status(manifest, "input")
+    observes_input = input_status in ("enabled", "legacy_unspecified")
     saved_qc = json.loads((path/'quality.json').read_text(encoding='utf-8')) if (path/'quality.json').exists() else None
     qc_consistent = bool(saved_qc and saved_qc['episode_id']==manifest['episode_id']
         and saved_qc['counts']==manifest['counts'] and saved_qc['decoded_frames']==len(frames))
@@ -77,8 +80,12 @@ def review(path, output):
         'capture_available_fraction':sum(bool(row['payload'].get('capture_available')) for row in frames)/len(frames),
         'game_focused_fraction':sum(bool(row['payload'].get('game_focused')) for row in frames)/len(frames),
         'fresh_frame_fraction':sum(bool(row['payload'].get('fresh')) for row in frames)/len(frames),
-        'input_sources':dict(sources), 'input_kinds':dict(kinds), 'human_nonrepeat_key_down':dict(keys),
-        'human_chord_down_counts':dict(chords.most_common(16)), 'input_timestamp_outside_episode':outside,
+        'capture_streams': manifest.get('capture_streams'), 'input_source_status': input_status,
+        'input_sources':dict(sources) if observes_input else None,
+        'input_kinds':dict(kinds) if observes_input else None,
+        'human_nonrepeat_key_down':dict(keys) if observes_input else None,
+        'human_chord_down_counts':dict(chords.most_common(16)) if observes_input else None,
+        'input_timestamp_outside_episode':outside if observes_input else None,
         'nearest_acquisition_offset_ms':percentiles(offsets), 'ocr_latency_ms':percentiles(scans),
         'ocr_queue_delay_ms':percentiles(queue_delays),
         'ocr_observation_age_ms':percentiles(observation_ages),

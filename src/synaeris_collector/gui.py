@@ -10,7 +10,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
-from .config import Config
+from .config import CAPTURE_STREAM_FIELDS, Config
 from .collector import Collector
 from .dataset import inspect_episode, transitions, decision_windows, build_dataset
 from .bgi import make_batch, deploy_batch
@@ -23,6 +23,8 @@ from .human import (SCENARIOS, recommended_config, profile_descriptor, save_pref
 from collections import deque
 
 
+STREAM_LABELS = {"input": "键鼠（含 Raw Input）", "telemetry": "BetterGI 遥测",
+                 "performance": "性能采样", "ocr": "OCR"}
 
 
 class App:
@@ -45,7 +47,7 @@ class App:
         style.configure("TCheckbutton", background="#111722", foreground="#e1e7f0")
         style.configure("TNotebook", background="#111722")
         style.configure("TNotebook.Tab", padding=(16, 8), background="#263244", foreground="#e1e7f0")
-        self.config = config or recommended_config(Config(scenario=SCENARIOS[0]))
+        self.config = config or recommended_config(Config(scenario=SCENARIOS[0])).video_only()
         self.messages = queue.Queue()
         self.collector = self.thread = self.latest = self.photo = None
         self.recording = self.busy = False
@@ -56,15 +58,17 @@ class App:
         self.numeric_fields = {key: tk.StringVar(value=str(getattr(self.config, key)))
                                for key in ["fps", "ocr_threads", "ocr_max_hz", "storage_budget_gb", "reserve_free_gb"]}
         self.scenario = tk.StringVar(value=self.config.scenario if self.config.scenario != "unspecified" else SCENARIOS[0])
-        self.standard = tk.BooleanVar(value=profile_descriptor(self.config)["standard"])
+        self.standard = tk.BooleanVar(value=profile_descriptor(self.config)["sampling_standard"])
         self.novel = tk.BooleanVar(value=self.config.novel)
         self.ood = tk.BooleanVar(value=self.config.ood)
-        self.ocr_enabled = tk.BooleanVar(value=self.config.ocr)
+        self.stream_fields = {field: tk.BooleanVar(value=getattr(self.config, field))
+                              for field in CAPTURE_STREAM_FIELDS.values()}
+        self.stream_summary = tk.StringVar()
         self.background = tk.BooleanVar(value=self.config.capture_background)
         self.note = tk.StringVar()
         self.status = tk.StringVar(value="准备就绪 · 打开原神后点开始")
         self.progress = tk.StringVar(value="保存位置已准备好，停止后自动保存并校验")
-        self.last_episode = tk.StringVar(value="无需游玩时打标签 · 停止后自动整理 · F10 停止；F6–F9标记可选")
+        self.last_episode = tk.StringVar(value="停止后保存母录像和诊断候选 · 数据菜单可复核")
         self.profile_label = tk.StringVar()
         self.session_widgets, self.parameter_widgets = [], []
         menu = tk.Menu(self.root)
@@ -82,7 +86,7 @@ class App:
             data.add_command(label=label, command=command)
         menu.add_cascade(label="数据", menu=data)
         help_menu = tk.Menu(menu, tearoff=False)
-        help_menu.add_command(label="使用说明", command=lambda: messagebox.showinfo("人工采集", "直接双击 SynaerisCollector.exe，完成正常 Windows 确认后点开始。\n无需手动标签；停止后自动整理候选片段并校验，F10停止。\nF6–F9思考/错误/发现/子目标标记可选。自动标签供之后复核，不代表成功或人的思考。\n首次探索、解谜、失败与接管尽量录完整过程。"))
+        help_menu.add_command(label="使用说明", command=lambda: messagebox.showinfo("人工采集", "直接双击 SynaerisCollector.exe，完成正常 Windows 确认后点开始。\n无需手动标签；停止后自动整理候选片段并校验。\n开始前核对采集流。关闭键鼠后用窗口内的停止按钮。自动标签供之后复核，不代表成功或人的思考。\n首次探索、解谜、失败与接管尽量录完整过程。"))
         menu.add_cascade(label="帮助", menu=help_menu)
         self.root.configure(menu=menu)
         body = ttk.Frame(self.root, padding=26)
@@ -97,6 +101,17 @@ class App:
         scene.bind("<<ComboboxSelected>>", lambda _: self.novel.set(self.scenario.get() != "熟练操作"))
         self.session_widgets.append(scene)
         ttk.Label(row, textvariable=self.profile_label, foreground="#7ae4cc").pack(side="right")
+        streams = ttk.Frame(body)
+        streams.pack(fill="x", pady=(10, 0))
+        for name, field in CAPTURE_STREAM_FIELDS.items():
+            toggle = ttk.Checkbutton(streams, text=STREAM_LABELS[name], variable=self.stream_fields[field],
+                                     command=self.update_stream_summary)
+            toggle.pack(side="left", padx=(0, 8))
+            self.session_widgets.append(toggle)
+        preset = ttk.Button(streams, text="Video-only", command=self.select_video_only)
+        preset.pack(side="left")
+        self.session_widgets.append(preset)
+        ttk.Label(body, textvariable=self.stream_summary, wraplength=780).pack(anchor="w", pady=(4, 0))
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(18, 12))
         self.start_button = ttk.Button(actions, text="开始采集", style="Primary.TButton", command=self.start)
@@ -110,6 +125,7 @@ class App:
         self.preview.pack(fill="both", expand=True, pady=14)
         ttk.Label(body, textvariable=self.last_episode, foreground="#9fb0c5", wraplength=820).pack(anchor="w")
         self.update_profile_label()
+        self.update_stream_summary()
         if startup_note:
             self.write_log(startup_note)
         self.root.after(200, self.tick)
@@ -127,8 +143,8 @@ class App:
                    for key, var in self.numeric_fields.items()}
         fields = {key: var.get() for key, var in self.fields.items()}
         custom = replace(self.config, **fields, **numeric, scenario=self.scenario.get(),
-                         novel=self.novel.get(), ood=self.ood.get(), ocr=self.ocr_enabled.get(),
-                         capture_background=self.background.get())
+                         novel=self.novel.get(), ood=self.ood.get(),
+                         capture_background=self.background.get(), **self.stream_choices())
         if self.standard.get():
             return recommended_config(custom)
         if self.background.get():
@@ -137,23 +153,39 @@ class App:
             custom = replace(custom, purpose="gameplay")
         return custom.validate()
 
+    def stream_choices(self):
+        return {field: value.get() for field, value in self.stream_fields.items()}
+
+    def update_stream_summary(self):
+        choices = self.stream_choices()
+        enabled = [STREAM_LABELS[name] for name, field in CAPTURE_STREAM_FIELDS.items() if choices[field]]
+        self.stream_summary.set("本次启用：画面 + " + " / ".join(enabled) if enabled
+                                else "Video-only · 画面与帧时间索引")
+
+    def select_video_only(self):
+        if self.busy:
+            return
+        for value in self.stream_fields.values():
+            value.set(False)
+        self.update_stream_summary()
+
     def update_profile_label(self):
-        self.profile_label.set("统一配置 · 30 FPS · 本地 OCR" if self.standard.get() else "自定义参数 · 单独标记")
+        self.profile_label.set("统一录像参数 · 30 FPS" if self.standard.get() else "自定义录像参数")
 
     def restore_defaults(self):
         if self.busy:
             return
-        self.config = recommended_config(self.config)
+        self.config = recommended_config(replace(self.config, **self.stream_choices()))
         self.standard.set(True)
         for key, var in {**self.fields, **self.numeric_fields}.items():
             if key not in {"output", "region", "quest", "puzzle", "poi"}:
                 var.set(str(getattr(self.config, key)))
-        self.ocr_enabled.set(True)
         self.background.set(False)
         self.sync_settings()
 
     def sync_settings(self):
         self.update_profile_label()
+        self.update_stream_summary()
         for widget in self.session_widgets:
             if widget.winfo_exists():
                 widget.state(["disabled"] if self.busy else ["!disabled"])
@@ -213,10 +245,9 @@ class App:
                                   state="readonly" if key in self.fields else "normal")
             widget.pack(side="left")
             self.parameter_widgets.append(widget)
-        for text, variable in [("本地 CPU OCR", self.ocr_enabled), ("实验后台观察（仅视觉校准）", self.background)]:
-            widget = ttk.Checkbutton(parameters, text=text, variable=variable)
-            widget.pack(anchor="w", pady=6)
-            self.parameter_widgets.append(widget)
+        widget = ttk.Checkbutton(parameters, text="实验后台观察（仅视觉校准）", variable=self.background)
+        widget.pack(anchor="w", pady=6)
+        self.parameter_widgets.append(widget)
         widget = ttk.Button(parameters, text="OCR 裁剪区域…", command=self.edit_rois)
         widget.pack(anchor="w", pady=6)
         self.parameter_widgets.append(widget)
@@ -235,7 +266,12 @@ class App:
 
     def preflight(self):
         try:
-            window = GameWindow(self.config.window_title)
+            config = self.current_config()
+            window = GameWindow(config.window_title)
+            if not config.capture_input:
+                self.status.set("已找到游戏窗口 · 键鼠采集关闭，等待可录制画面")
+                self.write_log(f"游戏 {window.title} · 窗口 {window.initial_rect} · 未检查键鼠权限")
+                return
             p = window.permissions()
             self.write_log(f"游戏 {window.title} · 窗口 {window.initial_rect} · 输入权限 {'通过' if p['input_permission_qualified'] else '不足'}")
             if not p["input_permission_qualified"]:
@@ -262,11 +298,13 @@ class App:
                 self.config = Config.load(path)
                 for key, var in {**self.fields, **self.numeric_fields}.items():
                     var.set(str(getattr(self.config, key)))
-                for var, value in [(self.novel, self.config.novel), (self.ocr_enabled, self.config.ocr),
+                for field, var in self.stream_fields.items():
+                    var.set(getattr(self.config, field))
+                for var, value in [(self.novel, self.config.novel),
                                    (self.ood, self.config.ood), (self.background, self.config.capture_background),
                                    (self.scenario, self.config.scenario)]:
                     var.set(value)
-                self.standard.set(profile_descriptor(self.config)["standard"])
+                self.standard.set(profile_descriptor(self.config)["sampling_standard"])
                 self.sync_settings()
                 self.write_log("配置已导入：" + path)
             except Exception as exc:
@@ -298,18 +336,22 @@ class App:
             return
         try:
             config = self.current_config()
-            ensure_port_available(config.bridge_port)
+            if config.capture_telemetry:
+                ensure_port_available(config.bridge_port)
             save_preferences(config)
         except Exception as exc:
             self.status.set(str(exc))
             return
+        self.config = config
         self.collector = Collector(config, lambda msg: self.messages.put(("log", msg)))
         self.recording = self.busy = True
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.sync_settings()
-        self.status.set("正在准备采集；恢复原神后自动开始")
-        self.root.iconify()
+        self.write_log(self.stream_summary.get())
+        self.status.set("正在准备采集；进入前台游戏窗口后开始")
+        if config.capture_input:
+            self.root.iconify()
         def run():
             try:
                 self.collector.storage_check()
@@ -535,7 +577,8 @@ class App:
                 self.status.set(text)
         if self.recording and self.collector and self.collector.writer:
             seconds = int(self.collector.writer.now()/1e9)
-            self.status.set("正在采集 · 游戏保持前台；F10停止并保存")
+            stop_hint = "F10 停止并保存" if self.collector.config.capture_input else "返回采集器按「停止并保存」"
+            self.status.set("正在采集 · 游戏保持前台；" + stop_hint)
             self.progress.set(f"采集时长 {seconds//60:02d}:{seconds%60:02d}")
             frame = self.collector.latest_preview
             if frame is not None:

@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 
+from .config import capture_source_status
 from .storage import iter_rows
 from .storage import atomic_json
 
@@ -156,16 +157,21 @@ def compile_episode(path, source_reference=None, min_ns=500_000_000,
         raise ValueError(f'Invalid frame chronology: {episode}')
     if any(row['payload']['frame_index'] != i for i, row in enumerate(frames)):
         raise ValueError(f'Invalid frame ordinal mapping: {episode}')
-    physical, raw = _physical_input(iter_rows(path, 'input'))
+    input_status = capture_source_status(manifest, "input")
+    telemetry_status = capture_source_status(manifest, "telemetry")
+    observes_input = input_status in ("enabled", "legacy_unspecified")
+    observes_telemetry = telemetry_status in ("enabled", "legacy_unspecified")
+    physical, raw = _physical_input(iter_rows(path, 'input')) if observes_input else ([], [])
     physical_times = [item[0] for item in physical]
     raw_times = [item[0] for item in raw]
     goal_labels = sorted((row for row in index.get('labels', [])
         if row['label'] in GOAL_LABELS), key=lambda row: row['timestamp_ns'])
     goal_times = [row['timestamp_ns'] for row in goal_labels]
-    poses = sorted((row for row in iter_rows(path, 'pose') if row['payload'].get('valid')),
+    pose_rows = iter_rows(path, 'pose') if observes_telemetry else ()
+    poses = sorted((row for row in pose_rows if row['payload'].get('valid')),
         key=lambda row: (row['monotonic_timestamp'], row['sequence']))
     pose_times = [row['monotonic_timestamp'] for row in poses]
-    tools = sorted(iter_rows(path, 'tools'),
+    tools = sorted(iter_rows(path, 'tools') if observes_telemetry else (),
         key=lambda row: (row['monotonic_timestamp'], row['sequence']))
     tool_times = [row['monotonic_timestamp'] for row in tools]
     signals = physical_times + [row['timestamp_ns'] for row in goal_labels]
@@ -212,14 +218,16 @@ def compile_episode(path, source_reference=None, min_ns=500_000_000,
             'affordance': unknown('No reviewed affordance'),
             'intent': unknown('Behavior does not reveal intent'),
             'expected_effect': unknown('No explicit pre-action expectation'),
-            'action': {'physical_status': 'observed_hook',
-                'held_keys_at_start': previous_state['held_keys'],
-                'held_buttons_at_start': previous_state['held_buttons'],
+            'action': {'physical_status': 'observed_hook' if observes_input else 'unavailable',
+                'input_source_status': input_status,
+                'telemetry_source_status': telemetry_status,
+                'held_keys_at_start': previous_state['held_keys'] if observes_input else None,
+                'held_buttons_at_start': previous_state['held_buttons'] if observes_input else None,
                 'qualified_physical_events': [dict(evidence=ref, **value)
                     for _, ref, value in controls],
-                'raw_mouse_candidate': {'event_count': len(raw_slice),
-                    'dx_counts': sum(item[1] for item in raw_slice),
-                    'dy_counts': sum(item[2] for item in raw_slice),
+                'raw_mouse_candidate': {'event_count': len(raw_slice) if observes_input else None,
+                    'dx_counts': sum(item[1] for item in raw_slice) if observes_input else None,
+                    'dy_counts': sum(item[2] for item in raw_slice) if observes_input else None,
                     'producer': 'unknown', 'provenance_qualified': False,
                     'training_weight': 0.0},
                 'tool_events': [{'kind': row['kind'],
@@ -251,7 +259,7 @@ def summarize(units):
         'intent_verified': sum(u['intent']['status'] == 'verified' for u in units),
         'qualified_mouse_units': sum(u['action']['raw_mouse_candidate']['provenance_qualified']
             for u in units),
-        'units_with_raw_mouse_candidate': sum(u['action']['raw_mouse_candidate']['event_count'] > 0
+        'units_with_raw_mouse_candidate': sum(bool(u['action']['raw_mouse_candidate']['event_count'])
             for u in units),
         'units_with_physical_transition': sum(bool(u['action']['qualified_physical_events'])
             for u in units),

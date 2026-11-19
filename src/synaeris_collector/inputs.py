@@ -12,6 +12,7 @@ class RawMouse:
         self.hwnd = None
         self.thread = threading.Thread(target=self.run, name="synaeris-raw-input", daemon=True)
         self.ready = threading.Event()
+        self.stop_event = threading.Event()
         self.error = None
 
     def start(self):
@@ -22,7 +23,12 @@ class RawMouse:
             raise self.error
 
     def run(self):
+        user = None
+        name = f"SynaerisRawMouse_{id(self)}"
+        registered_class = registered_device = False
         try:
+            if self.stop_event.is_set():
+                return
             user = ctypes.WinDLL("user32", use_last_error=True)
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
             proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
@@ -59,6 +65,7 @@ class RawMouse:
             user.RegisterClassW.argtypes = [ctypes.POINTER(WindowClass)]
             user.RegisterRawInputDevices.argtypes = [ctypes.POINTER(Device), wt.UINT, wt.UINT]
             user.DestroyWindow.argtypes = [wt.HWND]
+            user.IsWindow.argtypes = [wt.HWND]
             user.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
             user.UnregisterClassW.argtypes = [wt.LPCWSTR, wt.HINSTANCE]
             kernel.GetModuleHandleW.argtypes = [wt.LPCWSTR]
@@ -89,37 +96,49 @@ class RawMouse:
                     self.failure("RAW_INPUT_CALLBACK", exc)
                 return user.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-            name = f"SynaerisRawMouse_{id(self)}"
             instance = kernel.GetModuleHandleW(None)
             cls = WindowClass(0, callback, 0, 0, instance, None, None, None, None, name)
             if not user.RegisterClassW(ctypes.byref(cls)):
                 raise ctypes.WinError(ctypes.get_last_error())
+            registered_class = True
             self.hwnd = user.CreateWindowExW(0, name, name, 0, 0, 0, 0, 0, wt.HWND(-3), None, instance, None)
             if not self.hwnd:
                 raise ctypes.WinError(ctypes.get_last_error())
+            if self.stop_event.is_set():
+                return
             device = Device(1, 2, 0x100, self.hwnd)  # INPUTSINK, never NOLEGACY: game retains normal input.
             if not user.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(Device)):
                 raise ctypes.WinError(ctypes.get_last_error())
+            registered_device = True
             self.ready.set()
             message = wt.MSG()
-            while user.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            while not self.stop_event.is_set() and user.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
                 user.TranslateMessage(ctypes.byref(message))
                 user.DispatchMessageW(ctypes.byref(message))
-            # RIDEV_REMOVE unregisters this process only.
-            remove = Device(1, 2, 1, None)
-            user.RegisterRawInputDevices(ctypes.byref(remove), 1, ctypes.sizeof(Device))
-            user.UnregisterClassW(name, instance)
         except Exception as exc:
             self.error = exc
             self.failure("RAW_INPUT", exc)
+        finally:
+            if registered_device:
+                # RIDEV_REMOVE unregisters this process only.
+                remove = Device(1, 2, 1, None)
+                user.RegisterRawInputDevices(ctypes.byref(remove), 1, ctypes.sizeof(Device))
+            if self.hwnd and user.IsWindow(self.hwnd):
+                user.DestroyWindow(self.hwnd)
+            self.hwnd = None
+            if registered_class:
+                user.UnregisterClassW(name, instance)
             self.ready.set()
 
     def close(self):
-        if self.hwnd:
+        self.stop_event.set()
+        hwnd = self.hwnd
+        if hwnd:
             user = ctypes.WinDLL("user32")
             user.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
-            user.PostMessageW(self.hwnd, 0x0010, 0, 0)
-        self.thread.join(timeout=5)
+            user.PostMessageW(hwnd, 0x0010, 0, 0)
+        if self.thread.ident is not None:
+            self.thread.join(timeout=5)
         if self.thread.is_alive():
             raise RuntimeError("Raw Input shutdown timeout")
 
@@ -132,6 +151,9 @@ class InputRecorder:
         self.mouse_buttons = set()
         self.raw = RawMouse(self.delta, failure)
         self.keyboard = self.mouse = None
+
+    def bgi_tool_active(self):
+        return bool(self.bridge.active_tools) if self.bridge is not None else None
 
     def actor(self, injected):
         if not injected:
@@ -152,7 +174,7 @@ class InputRecorder:
             self.keys.discard(key)
         self.writer.emit("input", "KEY_DOWN" if down else "KEY_UP",
             dict(vk=key, scan=int(data.scanCode), injected=injected, repeat=repeat,
-                 bgi_tool_active=bool(self.bridge.active_tools)),
+                 bgi_tool_active=self.bgi_tool_active()),
             source="win32_low_level_hook", actor=self.actor(injected))
         if down and not repeat and not injected:
             if key in MARKERS:
@@ -193,7 +215,7 @@ class InputRecorder:
                 dict(dx=dx, dy=dy, unit="normalized_0_65535" if absolute else "raw_counts",
                      absolute=absolute, device_handle=device_handle, extra_info=extra_info,
                      injection_status="unavailable", provenance_qualified=False,
-                     bgi_tool_active=bool(self.bridge.active_tools)),
+                     bgi_tool_active=self.bgi_tool_active()),
                 source="win32_raw_input", actor="UNKNOWN")
 
     def start(self):
@@ -214,8 +236,19 @@ class InputRecorder:
             self.mouse_buttons.clear()
 
     def close(self):
+        errors = []
         for listener in (self.keyboard, self.mouse):
-            if listener:
-                listener.stop()
-                listener.join(timeout=3)
-        self.raw.close()
+            if listener is not None and listener.ident is not None:
+                try:
+                    listener.stop()
+                    listener.join(timeout=3)
+                    if listener.is_alive():
+                        raise RuntimeError("Input hook shutdown timeout")
+                except Exception as exc:
+                    errors.append(exc)
+        try:
+            self.raw.close()
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise RuntimeError("; ".join(str(error) for error in errors)) from errors[0]

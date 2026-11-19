@@ -210,6 +210,7 @@ class OCRWorker:
 
     def close(self):
         self.stop_event.set()
-        self.thread.join(timeout=30)
+        if self.thread.ident is not None:
+            self.thread.join(timeout=30)
         if self.thread.is_alive():
             raise RuntimeError("OCR worker did not stop")

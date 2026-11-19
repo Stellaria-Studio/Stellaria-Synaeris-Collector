@@ -5,6 +5,7 @@ import html
 import json
 from pathlib import Path
 import re
+from .config import capture_source_status
 from .storage import atomic_json, iter_rows
 
 VERSION = 'auto-index-v2'
@@ -54,6 +55,8 @@ def organize(episode):
     manifest = json.loads((path / 'manifest.json').read_text(encoding='utf-8-sig'))
     if manifest['status'] == 'recording':
         raise ValueError('停止录制并封存后才能自动整理')
+    input_status = capture_source_status(manifest, "input")
+    observes_input = input_status in ("enabled", "legacy_unspecified")
     duration = int(manifest.get('duration_ns', 0))
     if duration <= 0:
         raise ValueError('缺少有效时长')
@@ -105,7 +108,7 @@ def organize(episode):
         data = row['payload']
         if target is not None and row['kind'] == 'OCR_TEXT' and float(data.get('confidence') or 0) >= .75:
             target['texts'].append(row)
-    for row in iter_rows(path, 'input'):
+    for row in iter_rows(path, 'input') if observes_input else ():
         target = bucket(row)
         if target is None:
             continue
@@ -216,7 +219,7 @@ def organize(episode):
             held.clear()
             last_ocr_scene = None
             quiet_start, quiet_emitted = None, False
-        elif target['inputs'] or held:
+        elif not observes_input or target['inputs'] or held:
             quiet_start, quiet_emitted = None, False
         else:
             quiet_start = start if quiet_start is None else quiet_start
@@ -255,14 +258,16 @@ def organize(episode):
             'activities':sorted(activities),
             'activity_seconds':{name:(end-start)/SECOND for name in activities},
             'frame_count': target['frames'], 'available_frames': target['available'],
-            'focused_frames': target['focused'], 'input_event_count': target['inputs'],
+            'focused_frames': target['focused'], 'input_event_count': target['inputs'] if observes_input else None,
             'first': target.get('first'), 'last': target.get('last')}
         if activities:
             if activity_spans and activity_spans[-1]['end_ns']==start and activity_spans[-1]['activities']==record['activities'] and end-activity_spans[-1]['start_ns']<=120*SECOND:
                 activity_spans[-1]['end_ns']=end
             else:
                 activity_spans.append({'start_ns':start,'end_ns':end,'activities':record['activities'],
-                    'episode_id':manifest['episode_id'],'evidence_streams':['input','ocr'],
+                    'episode_id':manifest['episode_id'], 'evidence_streams': [
+                        stream for stream, observed in (('input', activities - {'subtitle_text'}),
+                                                        ('ocr', 'subtitle_text' in activities)) if observed],
                     'weak_label':True,'verified':False,'reward':None})
         if spans and spans[-1]['scene'] == scene and spans[-1]['evidence_source'] == source and end-spans[-1]['start_ns'] <= 120*SECOND:
             previous = spans[-1]
@@ -270,8 +275,10 @@ def organize(episode):
             previous['activities']=sorted(set(previous['activities'])|activities)
             for name,seconds in record['activity_seconds'].items():
                 previous['activity_seconds'][name]=previous['activity_seconds'].get(name,0)+seconds
-            for key in ('frame_count','available_frames','focused_frames','input_event_count'):
+            for key in ('frame_count','available_frames','focused_frames'):
                 previous[key] += record[key]
+            if observes_input:
+                previous['input_event_count'] += record['input_event_count']
             previous['score'] = min(previous['score'], score)
             if previous['first'] is None:
                 previous['first'] = record['first']
@@ -291,6 +298,7 @@ def organize(episode):
         'segments': spans, 'activity_spans':activity_spans, 'labels': labels, 'label_counts': dict(Counter(item['label'] for item in labels)),
         'scene_counts': dict(Counter(item['scene'] for item in spans)), 'invalid_timestamp_rows': invalid,
         'training_eligibility_changed': False, 'synthetic': manifest.get('synthetic', False),
+        'input_source_status': input_status,
         'activity_semantics':'Overlapping observed input/text candidates; neither UI modality nor verified game effects.',
         'limitation': 'Logical candidate segments only; mother data and manual annotations unchanged. Unknown scenes retained. No thinking, success, inventory, puzzle or combat outcome verification.'}
     atomic_json(path / 'auto_index.json', result)
@@ -306,7 +314,8 @@ def write_html(path, result):
             record['start_ns']/SECOND, record['end_ns']/SECOND,
             escape(SCENE_NAMES.get(record['scene'], record['scene'])),
             escape('、'.join('{} {:.0f}秒'.format(ACTIVITY_NAMES.get(name,name),record['activity_seconds'][name]) for name in record['activities'])),
-            '未验证', '{:.1f}s'.format(pts/SECOND) if pts is not None else '无可用帧', record['input_event_count']))
+            '未验证', '{:.1f}s'.format(pts/SECOND) if pts is not None else '无可用帧',
+            record['input_event_count'] if record['input_event_count'] is not None else '未采集'))
     def description(item):
         detail = item.get('detail') or {}
         if not isinstance(detail, dict):

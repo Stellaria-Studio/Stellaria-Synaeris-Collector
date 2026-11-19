@@ -1,6 +1,20 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 import json
+
+
+CAPTURE_STREAM_FIELDS = {
+    "input": "capture_input",
+    "telemetry": "capture_telemetry",
+    "performance": "capture_performance",
+    "ocr": "ocr",
+}
+
+
+def capture_source_status(manifest, name):
+    """Old episodes predate capture-source metadata."""
+    source = manifest.get("capture_streams", {}).get("sources", {}).get(name, {})
+    return source.get("status", "legacy_unspecified")
 
 
 @dataclass
@@ -41,8 +55,30 @@ class Config:
         "map": [0.65, 0.10, 0.99, 0.95],
         "title": [0.40, 0.92, 0.60, 0.975],
     })
+    capture_input: bool = True
+    capture_telemetry: bool = True
+    capture_performance: bool = True
+
+    def video_only(self):
+        return replace(self, **dict.fromkeys(CAPTURE_STREAM_FIELDS.values(), False))
+
+    def capture_streams(self):
+        requested = {"video": True, **{name: getattr(self, field) for name, field in CAPTURE_STREAM_FIELDS.items()}}
+        return {
+            "version": 1,
+            "mode": "custom" if any(requested[name] for name in CAPTURE_STREAM_FIELDS) else "video_only",
+            "scope": "Operator-selected capture policy; research authorization is external.",
+            "sources": {
+                name: {"requested": value, "started": False, "status": "not_started" if value else "disabled",
+                       "reason": None if value else "operator_config"}
+                for name, value in requested.items()
+            },
+        }
 
     def validate(self):
+        for name in CAPTURE_STREAM_FIELDS.values():
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a JSON boolean")
         if self.purpose not in {"gameplay", "calibration"}:
             raise ValueError("Invalid collection purpose")
         if self.actor not in {"HUMAN", "BGI", "AGENT", "SYNTHETIC"}:

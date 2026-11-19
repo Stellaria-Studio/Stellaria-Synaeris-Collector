@@ -14,13 +14,15 @@ from .perf import PerfWorker
 
 class Collector:
     def __init__(self, config, notify=None):
-        self.config = config.validate()
+        self.config = replace(config).validate()
         self.notify = notify or (lambda value: None)
         self.stop_event = threading.Event()
         self.writer = None
         self.ocr = None
         self.inputs = None
+        self.bridge = None
         self.error = None
+        self.failed_sources = set()
         self.capture_ms = None
         self.encode_ms = None
         self.frames = 0
@@ -39,14 +41,12 @@ class Collector:
         self.notify(message)
         if fatal:
             with self.lock:
-                self.error = message
+                if self.error is None:
+                    self.error = message
             self.stop()
 
     def metrics(self):
-        ocr_stats = self.ocr.stats() if self.ocr else {"ocr_queue_drops": 0,
-            "ocr_requests_coalesced": 0, "ocr_requests_submitted": 0,
-            "ocr_frames_processed": 0, "ocr_regions_scanned": 0,
-            "ocr_regions_cached": 0, "ocr_unknown_modes_suppressed": 0}
+        ocr_stats = self.ocr.stats() if self.ocr else {}
         return dict(capture_latency_ms=self.capture_ms, encode_submit_latency_ms=self.encode_ms,
                     capture_fps=self.frames / max(0.001, (time.perf_counter_ns()-self.start_ns)/1e9),
                     ocr_latency_ms=self.ocr.latency_ms if self.ocr else None,
@@ -63,8 +63,31 @@ class Collector:
             raise RuntimeError("Dataset storage budget reached")
         return {"dataset_gb": used, "free_gb": free}
 
+    def source_failure(self, name, source, exc, fatal=True):
+        if fatal:
+            with self.lock:
+                self.failed_sources.add(name)
+        self.fail(source, exc, fatal)
+
+    def stream_status(self, name, status, reason=None):
+        source = self.writer.manifest["capture_streams"]["sources"][name]
+        source.update(status=status, reason=reason)
+        if status == "enabled":
+            source["started"] = True
+
+    def start_stream(self, workers, name, factory):
+        try:
+            worker = workers[name] = factory()
+            worker.start()
+        except Exception:
+            self.stream_status(name, "unavailable", "startup_failed")
+            raise
+        self.stream_status(name, "enabled")
+        return worker
+
     def run(self, duration=None, stop_file=None):
-        capture = video = bridge = perf = None
+        capture = video = None
+        workers = {}
         self.start_ns = time.perf_counter_ns()
         try:
             self.storage_check()
@@ -81,30 +104,50 @@ class Collector:
                 "desktop_capture_privacy_guard": getattr(capture, "privacy_guard", None),
                 "client_rect": capture.window.initial_rect if capture.window else None,
                 "game_pid": capture.window.pid if capture.window else None})
-            if capture.window:
+            self.writer.manifest["capture_streams"] = self.config.capture_streams()
+            manifest_path = self.writer.path / "manifest.json"
+            atomic_json(manifest_path, self.writer.manifest)
+            input_ready = False
+            if self.config.capture_input and capture.window:
                 permissions = capture.window.permissions()
                 self.writer.manifest["capabilities"] = permissions
-                if not permissions["input_permission_qualified"]:
+                input_ready = permissions["input_permission_qualified"]
+                if not input_ready:
                     self.writer.manifest["unavailable"].append("input_permission_unqualified")
-                atomic_json(self.writer.path / "manifest.json", self.writer.manifest)
-                if self.config.purpose == "gameplay" and not permissions["input_permission_qualified"]:
-                    raise RuntimeError("Input permission preflight failed: launch the collector with the same integrity level as the game; local Windows authorization is required")
-            video = VideoWriter(self.writer.path / "visual.mkv", self.config, capture.width, capture.height)
+                    self.stream_status("input", "unavailable", "input_permission_unqualified")
+                    if self.config.purpose == "gameplay":
+                        raise RuntimeError("Input permission preflight failed: launch the collector with the same integrity level as the game; local Windows authorization is required")
+            else:
+                self.writer.manifest["capabilities"] = {"input_permission_qualified": None,
+                    "qualification_scope": "Input integrity not evaluated",
+                    "input_unavailable_reason": "no_game_window" if self.config.capture_input else "operator_config"}
+                if self.config.capture_input:
+                    self.stream_status("input", "unavailable", "no_game_window")
+            try:
+                video = VideoWriter(self.writer.path / "visual.mkv", self.config, capture.width, capture.height)
+            except Exception:
+                self.stream_status("video", "unavailable", "startup_failed")
+                raise
             self.writer.manifest["video"] = {"codec": video.codec, "fps": self.config.fps,
                 "width": capture.width, "height": capture.height, "time_mapping": "frames.parquet",
                 "encoder_qualification": video.qualifications, "audio": False}
-            atomic_json(self.writer.path / "manifest.json", self.writer.manifest)
-            bridge = TelemetryBridge(self.writer, self.config.bridge_port, self.state)
-            self.bridge = bridge
-            bridge.start()
-            if capture.window:
-                self.inputs = InputRecorder(capture.window, self.writer, bridge, self.stop, self.fail)
-                self.inputs.start()
+            self.stream_status("video", "enabled")
+            if self.config.capture_telemetry:
+                self.bridge = self.start_stream(workers, "telemetry", lambda: TelemetryBridge(
+                    self.writer, self.config.bridge_port, self.state,
+                    allow_input=input_ready, allow_ocr=self.config.ocr))
+            if input_ready:
+                self.inputs = self.start_stream(workers, "input", lambda: InputRecorder(
+                    capture.window, self.writer, self.bridge, self.stop,
+                    lambda *args, **kwargs: self.source_failure("input", *args, **kwargs)))
             if self.config.ocr:
-                self.ocr = OCRWorker(self.config, self.writer, self.fail)
-                self.ocr.start()
-            perf = PerfWorker(self.writer, self.config, self.metrics, self.fail)
-            perf.start()
+                self.ocr = self.start_stream(workers, "ocr", lambda: OCRWorker(
+                    self.config, self.writer,
+                    lambda *args, **kwargs: self.source_failure("ocr", *args, **kwargs)))
+            if self.config.capture_performance:
+                self.start_stream(workers, "performance",
+                    lambda: PerfWorker(self.writer, self.config, self.metrics, self.fail))
+            atomic_json(manifest_path, self.writer.manifest)
             self.writer.emit("events", "EPISODE_START", {"actor": self.config.actor, "novel": self.config.novel})
             self.notify(f"正在采集：{self.writer.path} · {video.codec} · {capture.backend}")
             next_frame = time.perf_counter()
@@ -143,10 +186,13 @@ class Collector:
                 self.encode_ms = (time.perf_counter_ns()-started) / 1e6
                 index = video.frames-1
                 self.frames = video.frames
-                self.writer.emit("frames", "VIDEO_FRAME", dict(frame_index=index,
-                    video_pts_ns=round(index / self.config.fps * 1e9), game_focused=active,
-                    fresh=fresh, capture_available=available, capture_latency_ms=self.capture_ms,
-                    **{k: v for k, v in getattr(capture, "metadata", {}).items() if k != "capture_available"}), timestamp=stamp)
+                frame_info = dict(frame_index=index, video_pts_ns=round(index / self.config.fps * 1e9),
+                                  game_focused=active, fresh=fresh, capture_available=available)
+                frame_info.update({k: v for k, v in getattr(capture, "metadata", {}).items()
+                                   if k != "capture_available"})
+                if self.config.capture_performance:
+                    frame_info["capture_latency_ms"] = self.capture_ms
+                self.writer.emit("frames", "VIDEO_FRAME", frame_info, timestamp=stamp)
                 if available and self.ocr and now >= next_ocr:
                     self.ocr.submit(frame, stamp, index)
                     next_ocr = now + 1 / self.config.ocr_max_hz
@@ -155,14 +201,8 @@ class Collector:
                     digest = hashlib.blake2b(frame[::16, ::16].tobytes(), digest_size=8).hexdigest()
                     self.writer.emit("events", "OBSERVATION", dict(frame_index=index, game_focused=active,
                         capture_available=available, visual_hash=digest, weak_label=True), timestamp=stamp)
-                    if bridge.latest_pose_ns is None or stamp-bridge.latest_pose_ns > 1e9:
-                        self.writer.emit("pose", "POSE_UNAVAILABLE", dict(x=None, y=None, yaw=None,
-                            valid=False, confidence=None, source="no_fresh_bgi_pose"), timestamp=stamp)
-                    ui = bridge.latest_ui if bridge.latest_ui_ns is not None and stamp-bridge.latest_ui_ns < 2e9 else None
-                    mode = (ui or {}).get("mode", "UNKNOWN")
-                    self.writer.emit("ui", "UI_OBSERVATION", dict(mode=mode,
-                        valid=ui is not None and str(mode).upper() != "UNKNOWN", frame_index=index,
-                        source=bridge.latest_ui_source if ui else "unknown"), timestamp=stamp)
+                    if self.bridge is not None:
+                        self.observe_telemetry(index, stamp)
                     next_obs = now + 1 / self.config.observation_hz
                 if now >= next_storage:
                     self.storage_check()
@@ -174,18 +214,22 @@ class Collector:
         except Exception as exc:
             self.fail("COLLECTOR", exc)
         finally:
-            for name, resource in [("INPUT", self.inputs), ("PERF", perf), ("BRIDGE", bridge),
-                                   ("OCR", self.ocr), ("CAPTURE", capture), ("VIDEO", video)]:
-                if resource:
+            for name in ("input", "performance", "telemetry", "ocr", "capture", "video"):
+                resource = {"capture": capture, "video": video}.get(name, workers.get(name))
+                if resource is not None:
                     try:
                         resource.close()
                     except Exception as exc:
-                        self.fail(name+"_CLOSE", exc)
+                        self.fail(name.upper()+"_CLOSE", exc)
+                        if self.writer:
+                            self.stream_status("video" if name == "capture" else name,
+                                               "unavailable", "shutdown_failed")
             if self.writer:
-                ocr_stats = self.ocr.stats() if self.ocr else {"ocr_queue_drops": 0,
-                    "ocr_requests_coalesced": 0, "ocr_requests_submitted": 0,
-                    "ocr_frames_processed": 0, "ocr_regions_scanned": 0,
-                    "ocr_regions_cached": 0, "ocr_unknown_modes_suppressed": 0}
+                sources = self.writer.manifest["capture_streams"]["sources"]
+                for name in self.failed_sources.copy():
+                    if sources[name]["status"] == "enabled":
+                        self.stream_status(name, "unavailable", "runtime_failed")
+                ocr_stats = self.ocr.stats() if self.ocr else {}
                 self.writer.close("failed" if self.error else "complete",
                     dict(error=self.error, encoded_frames=video.frames if video else 0,
                          **ocr_stats))
@@ -193,6 +237,17 @@ class Collector:
         if self.error:
             raise RuntimeError(self.error)
         return self.writer.path
+
+    def observe_telemetry(self, frame_index, stamp):
+        bridge = self.bridge
+        if bridge.latest_pose_ns is None or stamp-bridge.latest_pose_ns > 1e9:
+            self.writer.emit("pose", "POSE_UNAVAILABLE", dict(x=None, y=None, yaw=None,
+                valid=False, confidence=None, source="no_fresh_bgi_pose"), timestamp=stamp)
+        ui = bridge.latest_ui if bridge.latest_ui_ns is not None and stamp-bridge.latest_ui_ns < 2e9 else None
+        mode = (ui or {}).get("mode", "UNKNOWN")
+        self.writer.emit("ui", "UI_OBSERVATION", dict(mode=mode,
+            valid=ui is not None and str(mode).upper() != "UNKNOWN", frame_index=frame_index,
+            source=bridge.latest_ui_source if ui else "unknown"), timestamp=stamp)
 
     def state(self, stream, kind, data):
         if stream == "ui" and self.ocr:

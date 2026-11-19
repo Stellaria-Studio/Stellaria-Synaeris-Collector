@@ -116,7 +116,8 @@ def validate_request(policy, request):
         if (output != (root / "data/episodes").resolve() or config.actor != "BGI"
                 or config.purpose != "gameplay" or config.capture in {"synthetic", "wgc"} or config.capture_background or config.ffmpeg
                 or config.window_title != "原神" or config.quest != group or config.bridge_port != 18765
-                or config.fps != 30 or config.ocr_threads > 2):
+                or config.fps != 30 or config.ocr_threads > 2
+                or not config.capture_input or not config.capture_telemetry):
             raise ValueError("Unsupported gameplay collector configuration")
         config.bgi_dir = policy["bgi"]
         queue.append({"stage": stage, "config": config, "group": canonical_group(expected),

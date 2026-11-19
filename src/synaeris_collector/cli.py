@@ -23,6 +23,11 @@ def main():
     record.add_argument("--restore-game", action="store_true", help="Try one normal game-window restore during startup, after integrity checks")
     record.add_argument("--synthetic", action="store_true")
     record.add_argument("--no-ocr", action="store_true")
+    record.add_argument("--video-only", action="store_true",
+                        help="Disable local input, telemetry listener, performance sampling and OCR")
+    record.add_argument("--no-input", action="store_true")
+    record.add_argument("--no-telemetry", action="store_true")
+    record.add_argument("--no-performance", action="store_true")
     for cmd in ("inspect", "mine", "recover", "windows", "organize"):
         item = commands.add_parser(cmd)
         item.add_argument("episode")
@@ -53,7 +58,9 @@ def main():
     result = None
     if args.command == "gui":
         from .gui import App
-        App(Config.load(args.config)).run()
+        from .human import load_preferences
+        config, note = (Config.load(args.config), "") if args.config else load_preferences()
+        App(config, startup_note=note).run()
     elif args.command == "record":
         from .collector import Collector
         config = Config.load(args.config)
@@ -61,13 +68,17 @@ def main():
             config.output = args.output
         if args.synthetic:
             config.capture = "synthetic"
-        if args.no_ocr:
-            config.ocr = False
+        if args.video_only:
+            config = config.video_only()
+        for requested, field in ((args.no_input, "capture_input"), (args.no_telemetry, "capture_telemetry"),
+                                 (args.no_performance, "capture_performance"), (args.no_ocr, "ocr")):
+            if requested:
+                setattr(config, field, False)
         if args.duration is not None and args.duration <= 0:
             parser.error("duration must be positive")
         collector = Collector(config, print)
         signal.signal(signal.SIGINT, lambda *_: collector.stop())
-        if args.wait_game > 0 and not args.synthetic:
+        if args.wait_game > 0 and config.capture != "synthetic":
             from .capture import GameWindow
             deadline = time.monotonic() + args.wait_game
             print("Waiting for the game to be focused and restored", flush=True)
@@ -77,7 +88,7 @@ def main():
                     return
                 try:
                     window = GameWindow(config.window_title)
-                    if args.restore_game and not restore_attempted:
+                    if args.restore_game and config.capture_input and not restore_attempted:
                         restore_attempted = True
                         restored = window.restore_for_collection()
                         print(f"Normal game-window startup restore attempted; focused={restored}", flush=True)
