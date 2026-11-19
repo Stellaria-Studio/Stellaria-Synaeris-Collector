@@ -34,10 +34,13 @@ class Collector:
     def stop(self):
         self.stop_event.set()
 
-    def fail(self, source, exc, fatal=True):
+    def fail(self, source, exc, fatal=True, *, capture_source=None, timestamp=None):
         message = f"{source}: {exc}"
         if self.writer:
-            self.writer.emit("events", "COLLECTOR_ERROR", {"message": message, "fatal": fatal})
+            details = {"message": message, "fatal": fatal}
+            if capture_source is not None:
+                details.update(capture_source=capture_source, operation=source)
+            self.writer.emit("events", "COLLECTOR_ERROR", details, timestamp=timestamp)
         self.notify(message)
         if fatal:
             with self.lock:
@@ -63,11 +66,11 @@ class Collector:
             raise RuntimeError("Dataset storage budget reached")
         return {"dataset_gb": used, "free_gb": free}
 
-    def source_failure(self, name, source, exc, fatal=True):
+    def source_failure(self, name, source, exc, fatal=True, *, timestamp=None):
         if fatal:
             with self.lock:
                 self.failed_sources.add(name)
-        self.fail(source, exc, fatal)
+        self.fail(source, exc, fatal, capture_source=name, timestamp=timestamp)
 
     def stream_status(self, name, status, reason=None):
         source = self.writer.manifest["capture_streams"]["sources"][name]
@@ -145,8 +148,9 @@ class Collector:
                     self.config, self.writer,
                     lambda *args, **kwargs: self.source_failure("ocr", *args, **kwargs)))
             if self.config.capture_performance:
-                self.start_stream(workers, "performance",
-                    lambda: PerfWorker(self.writer, self.config, self.metrics, self.fail))
+                self.start_stream(workers, "performance", lambda: PerfWorker(
+                    self.writer, self.config, self.metrics,
+                    lambda *args, **kwargs: self.source_failure("performance", *args, **kwargs)))
             atomic_json(manifest_path, self.writer.manifest)
             self.writer.emit("events", "EPISODE_START", {"actor": self.config.actor, "novel": self.config.novel})
             self.notify(f"正在采集：{self.writer.path} · {video.codec} · {capture.backend}")
@@ -218,17 +222,26 @@ class Collector:
                 resource = {"capture": capture, "video": video}.get(name, workers.get(name))
                 if resource is not None:
                     try:
-                        resource.close()
+                        coverage = resource.close()
                     except Exception as exc:
-                        self.fail(name.upper()+"_CLOSE", exc)
+                        source = "video" if name == "capture" else name
+                        self.fail(name.upper()+"_CLOSE", exc, capture_source=source)
                         if self.writer:
-                            self.stream_status("video" if name == "capture" else name,
-                                               "unavailable", "shutdown_failed")
+                            self.stream_status(source, "unavailable", "shutdown_failed")
+                    else:
+                        if name == "performance" and coverage is not None:
+                            performance = self.writer.manifest["capture_streams"]["sources"]["performance"]
+                            if performance["started"]:
+                                performance["sample_coverage"] = coverage
             if self.writer:
                 sources = self.writer.manifest["capture_streams"]["sources"]
                 for name in self.failed_sources.copy():
                     if sources[name]["status"] == "enabled":
                         self.stream_status(name, "unavailable", "runtime_failed")
+                performance = sources["performance"]
+                if (performance["status"] == "enabled"
+                        and performance.get("sample_coverage", {}).get("state") == "unavailable"):
+                    self.stream_status("performance", "unavailable", "sampling_unavailable")
                 ocr_stats = self.ocr.stats() if self.ocr else {}
                 self.writer.close("failed" if self.error else "complete",
                     dict(error=self.error, encoded_frames=video.frames if video else 0,

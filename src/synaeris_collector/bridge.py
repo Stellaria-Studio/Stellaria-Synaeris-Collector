@@ -2,11 +2,48 @@ import hmac
 import hashlib
 import json
 import secrets
+import socket
 import threading
 from collections import Counter, OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ALLOWED = {"pose", "ui", "objects", "quest", "tools", "events", "ocr", "input"}
+CAPTURE_KIND_SOURCE = {
+    "BGI_INPUT_DISPATCH": "input",
+    "OCR_TEXT": "ocr", "OCR_SCAN": "ocr", "OCR_CACHE": "ocr",
+    "QUEST_TEXT_CANDIDATE": "ocr", "UI_AFFORDANCE_CANDIDATE": "ocr", "ITEM_RECEIPT_CANDIDATE": "ocr",
+}
+
+
+class _TelemetryServer(ThreadingHTTPServer):
+    daemon_threads = False
+
+    def __init__(self, address, handler):
+        self.clients = set()
+        self.clients_lock = threading.Lock()
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        with self.clients_lock:
+            self.clients.add(request)
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            with self.clients_lock:
+                self.clients.discard(request)
+
+    def server_close(self):
+        # Wake idle keep-alive clients so server_close can join their handlers.
+        with self.clients_lock:
+            for client in self.clients:
+                try:
+                    client.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass  # A peer or its handler may already have closed the socket.
+        super().server_close()
 
 
 class TelemetryBridge:
@@ -45,7 +82,7 @@ class TelemetryBridge:
             def handle(self):
                 try:
                     super().handle()
-                except (ConnectionResetError, BrokenPipeError):
+                except ConnectionError:
                     # A disconnected loopback client can reconnect and retry
                     # its stable event identity. There is no partial row here.
                     self.close_connection = True
@@ -102,8 +139,7 @@ class TelemetryBridge:
                 except (ValueError, KeyError, TypeError, OverflowError) as exc:
                     self.reply(400, {"error": str(exc)})
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-        self.server.daemon_threads = True
+        self.server = _TelemetryServer(("127.0.0.1", port), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self):
@@ -117,6 +153,12 @@ class TelemetryBridge:
             raise ValueError("stream not allowed")
         if stream in self.disabled_streams:
             raise ValueError(f"{stream} capture disabled")
+        kind = item.get("kind", "TELEMETRY")
+        if not isinstance(kind, str) or len(kind) > 128:
+            raise ValueError("invalid kind")
+        capture_source = CAPTURE_KIND_SOURCE.get(kind)
+        if capture_source in self.disabled_streams:
+            raise ValueError(f"{capture_source} capture disabled")
         data = item.get("payload", {})
         if not isinstance(data, dict):
             raise ValueError("payload must be object")
@@ -134,9 +176,6 @@ class TelemetryBridge:
             data = {**data, "producer_telemetry_drops": int(item["telemetry_drops"])}
         if isinstance(item.get("telemetry_diagnostics"), dict):
             data = {**data, "producer_diagnostics": item["telemetry_diagnostics"]}
-        kind = item.get("kind", "TELEMETRY")
-        if not isinstance(kind, str) or len(kind) > 128:
-            raise ValueError("invalid kind")
         arrival = self.writer.now()
         stamp = arrival
         if "qpc_ns" in item:

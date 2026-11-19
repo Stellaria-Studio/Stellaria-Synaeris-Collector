@@ -1,7 +1,9 @@
 from dataclasses import replace
+from http.client import HTTPConnection
 import json
 import socket
 import sys
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -74,7 +76,7 @@ def test_video_only_does_not_create_optional_resources_or_emit_observations(tmp_
         for resource in ("InputRecorder", "TelemetryBridge", "PerfWorker", "OCRWorker"):
             monkeypatch.setattr(runtime, resource, forbidden)
         monkeypatch.setattr(inputs, "RawMouse", forbidden)
-        monkeypatch.setattr(bridge, "ThreadingHTTPServer", forbidden)
+        monkeypatch.setattr(bridge, "_TelemetryServer", forbidden)
         monkeypatch.setattr(perf, "gpu_sample", forbidden)
         monkeypatch.setattr(perf.psutil, "cpu_percent", forbidden)
         monkeypatch.setattr(perf.psutil, "virtual_memory", forbidden)
@@ -455,3 +457,194 @@ def test_gui_cli_respects_preferences_and_explicit_import(tmp_path, monkeypatch,
     monkeypatch.setattr(sys, "argv", ["collector", "gui", *(["--config", str(path)] if explicit else [])])
     main()
     assert received == [(config, "" if explicit else "fixture")]
+
+@pytest.mark.parametrize("failed_attempts, expected_state, expected_status", [
+    ((False,), "sampled", "enabled"),
+    ((False, True, False), "partial", "enabled"),
+    ((False, True), "partial", "enabled"),
+    ((True, True), "unavailable", "unavailable"),
+    ((False, True, True), "unavailable", "unavailable"),
+])
+def test_performance_sampling_faults_are_preserved_in_sealed_episode(
+        tmp_path, monkeypatch, failed_attempts, expected_state, expected_status):
+    config = replace(Config(output=str(tmp_path)).video_only(), capture_performance=True, perf_hz=10)
+    c = runtime.Collector(config)
+    capture = stub_capture(monkeypatch, c)
+    original_grab = capture.grab
+    finished = threading.Event()
+    attempts = iter(failed_attempts)
+    rows = []
+    emitted_frame = threading.Event()
+
+    def sample():
+        if next(attempts):
+            raise TimeoutError("fixture probe timeout")
+        return {"available": False}
+
+    def grab():
+        assert finished.wait(3), "Performance worker did not finish the fixture attempts"
+        frame = original_grab()
+        emitted_frame.set()
+        return frame
+
+    original_emit = EpisodeWriter.emit
+
+    def emit(writer, stream, kind, payload=None, **fields):
+        recorded = original_emit(writer, stream, kind, payload, **fields)
+        if kind == "PERF_SAMPLE" or (
+                kind == "COLLECTOR_ERROR" and payload["message"].startswith("PERFORMANCE_SAMPLE:")):
+            rows.append(kind)
+            if len(rows) == len(failed_attempts):
+                finished.set()
+                emitted_frame.wait(3)
+        return recorded
+
+    capture.grab = grab
+    monkeypatch.setattr(perf, "gpu_sample", sample)
+    monkeypatch.setattr(EpisodeWriter, "emit", emit)
+    path = c.run()
+    manifest = read_manifest(path)
+    source = manifest["capture_streams"]["sources"]["performance"]
+    assert source["requested"] and source["started"]
+    assert source["status"] == expected_status
+    assert source["reason"] == ("sampling_unavailable" if expected_status == "unavailable" else None)
+    assert manifest["status"] == "complete" and capture.video.closed
+    assert manifest["counts"]["frames"] == 1
+    assert manifest["capture_streams"]["sources"]["video"]["status"] == "enabled"
+    assert all(manifest["capture_streams"]["sources"][name]["status"] == "disabled"
+               for name in ("input", "telemetry", "ocr"))
+
+    errors = [row for row in iter_rows(path, "events") if row["kind"] == "COLLECTOR_ERROR"]
+    samples = list(iter_rows(path, "perf"))
+    assert len(errors) == sum(failed_attempts)
+    assert len(samples) == len(failed_attempts) - len(errors)
+    assert all(row["payload"] == {"message": "PERFORMANCE_SAMPLE: fixture probe timeout",
+                                  "fatal": False, "capture_source": "performance",
+                                  "operation": "PERFORMANCE_SAMPLE"} for row in errors)
+    chronology = sorted((*errors, *samples), key=lambda row: row["monotonic_timestamp"])
+    assert [row["kind"] == "COLLECTOR_ERROR" for row in chronology] == list(failed_attempts)
+    trailing_failures = len(failed_attempts) - max(
+        (i + 1 for i, failed in enumerate(failed_attempts) if not failed), default=0)
+    assert source["sample_coverage"] == {
+        "state": expected_state,
+        "successful_samples": len(samples),
+        "failed_samples": len(errors),
+        "consecutive_failures": trailing_failures,
+        "open_gap_start_ns": errors[-trailing_failures]["monotonic_timestamp"] if trailing_failures else None,
+    }
+
+
+@pytest.mark.parametrize("fault, reason, operation, started", [
+    ("startup", "startup_failed", "COLLECTOR", False),
+    ("worker", "runtime_failed", "PERFORMANCE_WORKER", True),
+    ("shutdown", "shutdown_failed", "PERFORMANCE_CLOSE", True),
+])
+def test_performance_lifecycle_errors_seal_and_release_other_resources(
+        tmp_path, monkeypatch, fault, reason, operation, started):
+    c = runtime.Collector(replace(Config(output=str(tmp_path)).video_only(), capture_performance=True))
+    capture = stub_capture(monkeypatch, c)
+    workers = []
+
+    def broken():
+        raise RuntimeError("fixture lifecycle failure")
+
+    class Worker(perf.PerfWorker):
+        def __init__(self, *args):
+            super().__init__(*args)
+            workers.append(self)
+
+        def start(self):
+            if fault == "startup":
+                broken()
+            super().start()
+
+        def close(self):
+            summary = super().close()
+            if fault == "shutdown":
+                broken()
+            return summary
+
+    monkeypatch.setattr(runtime, "PerfWorker", Worker)
+    monkeypatch.setattr(perf, "gpu_sample", lambda: {"available": False})
+    if fault == "worker":
+        monkeypatch.setattr(perf.psutil, "Process", broken)
+    with pytest.raises(RuntimeError, match="fixture lifecycle failure"):
+        c.run()
+    path = c.writer.path
+    manifest = read_manifest(path)
+    performance = manifest["capture_streams"]["sources"]["performance"]
+    assert manifest["status"] == "failed"
+    assert performance["started"] is started and performance["requested"]
+    assert (performance["status"], performance["reason"]) == ("unavailable", reason)
+    if fault == "worker":
+        assert performance["sample_coverage"]["state"] == "unavailable"
+        assert performance["sample_coverage"]["successful_samples"] == 0
+    assert len(workers) == 1 and not workers[0].thread.is_alive()
+    assert capture.closed and capture.video.closed
+    assert manifest["capture_streams"]["sources"]["video"]["status"] == "enabled"
+    errors = [row["payload"] for row in iter_rows(path, "events") if row["kind"] == "COLLECTOR_ERROR"]
+    assert errors and all(item["fatal"] for item in errors)
+    if fault != "startup":
+        assert errors[0]["capture_source"] == "performance"
+        assert errors[0]["operation"] == operation
+
+
+@pytest.mark.parametrize("kind, required_stream", [
+    ("BGI_INPUT_DISPATCH", "input"),
+    ("OCR_TEXT", "ocr"),
+    ("OCR_SCAN", "ocr"),
+    ("OCR_CACHE", "ocr"),
+    ("ITEM_RECEIPT_CANDIDATE", "ocr"),
+])
+def test_telemetry_blocks_disabled_source_records_relabelled_as_generic_events(tmp_path, kind, required_stream):
+    writer = EpisodeWriter(Config(output=str(tmp_path)).video_only())
+    sink = bridge.TelemetryBridge(writer, 0, allow_input=False, allow_ocr=False)
+    sink.start()
+    connection = HTTPConnection(*sink.server.server_address, timeout=2)
+    try:
+        request = {"episode_id": writer.episode_id, "stream": "events", "kind": kind,
+                   "source": "bettergi_native", "payload": {"fixture": True}}
+        connection.request("POST", "/telemetry", json.dumps(request), {
+            "X-Synaeris-Token": sink.token, "Content-Type": "application/json", "Connection": "close"})
+        result = connection.getresponse()
+        body = json.loads(result.read())
+        assert result.status == 400
+        assert required_stream + " capture disabled" in body["error"]
+    finally:
+        connection.close()
+        sink.close()
+        writer.close()
+    assert not sink.thread.is_alive() and sink.server.socket.fileno() == -1
+    assert all(row["kind"] != kind for row in iter_rows(writer.path, "events"))
+
+
+def test_telemetry_close_releases_a_test_owned_keepalive_connection(tmp_path, monkeypatch):
+    writer = EpisodeWriter(Config(output=str(tmp_path)).video_only())
+    sink = bridge.TelemetryBridge(writer, 0)
+    handlers = []
+    original_handle = sink.server.RequestHandlerClass.handle
+
+    def handle(handler):
+        handlers.append(threading.current_thread())
+        original_handle(handler)
+
+    monkeypatch.setattr(sink.server.RequestHandlerClass, "handle", handle)
+    sink.start()
+    connection = HTTPConnection(*sink.server.server_address, timeout=2)
+    try:
+        connection.request("GET", "/session")
+        result = connection.getresponse()
+        assert result.status == 200 and not result.will_close
+        result.read()
+        client = connection.sock
+        assert client is not None
+        sink.close()
+        assert not sink.thread.is_alive() and sink.server.socket.fileno() == -1
+        client.settimeout(0.15)
+        assert client.recv(1) == b""
+        assert len(handlers) == 1 and not handlers[0].is_alive()
+    finally:
+        connection.close()
+        if not sink.closing.is_set():
+            sink.close()
+        writer.close()

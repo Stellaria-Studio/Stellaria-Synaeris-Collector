@@ -29,12 +29,20 @@ class PerfWorker:
         self.writer, self.config, self.metrics, self.failure = writer, config, metrics, failure
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
+        self.successful_samples = self.failed_samples = self.consecutive_failures = 0
+        self.open_gap_start_ns = None
+        self.worker_failed = False
 
     def start(self):
         self.thread.start()
 
     def run(self):
-        process = psutil.Process()
+        try:
+            process = psutil.Process()
+        except Exception as exc:
+            self.worker_failed = True
+            self.failure("PERFORMANCE_WORKER", exc)
+            return
         while not self.stop_event.is_set():
             start = self.writer.now()
             try:
@@ -45,9 +53,16 @@ class PerfWorker:
                         "collector_cpu_pct": process.cpu_percent(), "game_fps": None,
                         "game_frame_time_ms": None, "game_fps_source": "unavailable",
                         **self.metrics(), "sample_duration_ms": (self.writer.now()-start)/1e6}
-                self.writer.emit("perf", "PERF_SAMPLE", data, source="psutil+nvidia-smi", timestamp=start)
+                if self.writer.emit("perf", "PERF_SAMPLE", data, source="psutil+nvidia-smi", timestamp=start):
+                    self.successful_samples += 1
+                    self.consecutive_failures = 0
+                    self.open_gap_start_ns = None
             except Exception as exc:
-                self.failure("PERFORMANCE_SAMPLE", exc, fatal=False)
+                self.failed_samples += 1
+                self.consecutive_failures += 1
+                if self.open_gap_start_ns is None:
+                    self.open_gap_start_ns = start
+                self.failure("PERFORMANCE_SAMPLE", exc, fatal=False, timestamp=start)
             self.stop_event.wait(1 / self.config.perf_hz)
 
     def close(self):
@@ -56,3 +71,13 @@ class PerfWorker:
             self.thread.join(timeout=5)
         if self.thread.is_alive():
             raise RuntimeError("Performance worker shutdown timeout")
+        if self.worker_failed or (self.failed_samples and not self.successful_samples) or self.consecutive_failures >= 2:
+            state = "unavailable"
+        elif self.failed_samples:
+            state = "partial"
+        elif self.successful_samples:
+            state = "sampled"
+        else:
+            state = "no_samples"
+        return {"state": state, "successful_samples": self.successful_samples, "failed_samples": self.failed_samples,
+                "consecutive_failures": self.consecutive_failures, "open_gap_start_ns": self.open_gap_start_ns}
