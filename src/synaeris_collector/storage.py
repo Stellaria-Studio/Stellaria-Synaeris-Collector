@@ -134,10 +134,12 @@ def recover(path):
     buffers = {s: [] for s in STREAMS}
     counts = {s: 0 for s in STREAMS}
     corrupt = 0
-    with (path / "journal.jsonl").open(encoding="utf-8") as f:
+    with (path / "journal.jsonl").open("rb") as f:
         for line in f:
             try:
-                row = json.loads(line)
+                row = json.loads(line.decode("utf-8"))
+                if not isinstance(row, dict):
+                    raise ValueError("Journal row is not an object")
                 stream = row.pop("stream")
                 if stream not in STREAMS or row["episode_id"] != manifest["episode_id"]:
                     raise ValueError("Journal identity mismatch")
@@ -153,8 +155,9 @@ def recover(path):
             writers[stream].write_table(pa.Table.from_pylist(buffers[stream], schema=SCHEMA))
         writers[stream].close()
         original = path / f"{stream}.parquet"
-        if original.exists():
-            original.replace(path / f"{stream}.pre-recovery.parquet")
+        backup = path / f"{stream}.pre-recovery.parquet"
+        if original.exists() and not backup.exists():
+            original.replace(backup)
         (path / f"{stream}.recovered.parquet").replace(original)
     manifest.update(status="recovered_partial", counts=counts, corrupt_journal_lines=corrupt)
     atomic_json(path / "manifest.json", manifest)

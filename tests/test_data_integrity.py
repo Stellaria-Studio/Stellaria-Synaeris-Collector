@@ -72,6 +72,45 @@ def test_recovery_rebuilds_multiple_streams_and_ignores_torn_tail(tmp_path):
     assert (writer.path / "ocr.pre-recovery.parquet").exists()
 
 
+def test_recovery_counts_torn_utf8_as_tail_damage(tmp_path):
+    writer = episode(tmp_path, capture="synthetic")
+    writer.emit("ocr", "OCR_TEXT", {"text": "调查机关"}, timestamp=10)
+    writer.close("failed")
+    journal = writer.path / "journal.jsonl"
+    with journal.open("ab") as file:
+        file.write(b'{"stream":"ocr","text":"\xe8\xb0')
+    original_journal = journal.read_bytes()
+
+    result = recover(writer.path)
+
+    assert result["status"] == "recovered_partial"
+    assert result["corrupt_journal_lines"] == 1
+    assert list(iter_rows(writer.path, "ocr"))[0]["payload"]["text"] == "调查机关"
+    assert journal.read_bytes() == original_journal
+
+
+def test_recovery_retry_preserves_original_parquet(tmp_path):
+    writer = episode(tmp_path, capture="synthetic")
+    writer.emit("frames", "VIDEO_FRAME", {"frame_index": 0}, timestamp=10)
+    writer.close("failed")
+    original = writer.path / "frames.parquet"
+    backup = writer.path / "frames.pre-recovery.parquet"
+    # An interrupted recorder can leave the event journal intact but an unfinished Parquet.
+    original.write_bytes(b"PAR1 unfinished original")
+    mother = writer.path / "visual.mkv"
+    mother.write_bytes(b"synthetic mother bytes")
+    journal = (writer.path / "journal.jsonl").read_bytes()
+
+    recover(writer.path)
+    second = recover(writer.path)
+
+    assert second["status"] == "recovered_partial" and second["counts"]["frames"] == 1
+    assert backup.read_bytes() == b"PAR1 unfinished original"
+    assert list(iter_rows(writer.path, "frames"))[0]["payload"]["frame_index"] == 0
+    assert mother.read_bytes() == b"synthetic mother bytes"
+    assert (writer.path / "journal.jsonl").read_bytes() == journal
+
+
 def test_bridge_rejects_cross_episode_and_clock_mismatch(tmp_path):
     writer = episode(tmp_path)
     bridge = TelemetryBridge(writer, 0)
