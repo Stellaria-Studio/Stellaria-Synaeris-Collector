@@ -18,6 +18,14 @@ from synaeris_collector.qualification import qualify
 from synaeris_collector.storage import EpisodeWriter, iter_rows
 
 
+@pytest.fixture(autouse=True)
+def fixture_disk_capacity(monkeypatch):
+    # Capture lifecycle tests use isolated ephemeral data. Exercise the space
+    # check against a deterministic observation instead of the host's free disk.
+    monkeypatch.setattr(runtime.shutil, "disk_usage",
+                        lambda _: SimpleNamespace(free=50_000_000_000))
+
+
 def forbidden(*_, **__):
     pytest.fail("A prohibited capture resource or system probe was reached")
 

@@ -53,7 +53,7 @@ def native_scene(mode):
 def organize(episode):
     path = Path(episode).resolve()
     manifest = json.loads((path / 'manifest.json').read_text(encoding='utf-8-sig'))
-    if manifest['status'] == 'recording':
+    if manifest['status'] in ('recording', 'recovering'):
         raise ValueError('停止录制并封存后才能自动整理')
     input_status = capture_source_status(manifest, "input")
     observes_input = input_status in ("enabled", "legacy_unspecified")

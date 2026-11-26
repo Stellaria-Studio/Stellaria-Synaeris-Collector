@@ -1,10 +1,14 @@
 import json
+import subprocess
+import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 import time
 import urllib.request
 import pytest
 from synaeris_collector.config import Config
+from synaeris_collector import storage
 from synaeris_collector.storage import EpisodeWriter, iter_rows, recover
 from synaeris_collector.bridge import TelemetryBridge
 from synaeris_collector.dataset import transitions, decision_windows, build_dataset
@@ -70,6 +74,8 @@ def test_recovery_rebuilds_multiple_streams_and_ignores_torn_tail(tmp_path):
     assert len(list(iter_rows(writer.path, "input"))) == 1
     assert list(iter_rows(writer.path, "ocr"))[0]["payload"]["text"] == "调查机关"
     assert (writer.path / "ocr.pre-recovery.parquet").exists()
+    assert result["pre_recovery_files"] == writer.manifest["files"]
+    assert result["files"]["ocr.parquet"]["bytes"] == (writer.path / "ocr.parquet").stat().st_size
 
 
 def test_recovery_counts_torn_utf8_as_tail_damage(tmp_path):
@@ -109,6 +115,105 @@ def test_recovery_retry_preserves_original_parquet(tmp_path):
     assert list(iter_rows(writer.path, "frames"))[0]["payload"]["frame_index"] == 0
     assert mother.read_bytes() == b"synthetic mother bytes"
     assert (writer.path / "journal.jsonl").read_bytes() == journal
+
+
+def test_recovery_rejects_live_writer_and_concurrent_recovery(tmp_path, monkeypatch):
+    writer = episode(tmp_path, capture="synthetic")
+    try:
+        with pytest.raises(RuntimeError, match="already in use"):
+            recover(writer.path)
+    finally:
+        writer.close("failed")
+    started, release = threading.Event(), threading.Event()
+    errors = []
+    publish = storage.atomic_json
+
+    def pause(path, manifest):
+        if manifest["status"] == "recovering":
+            started.set()
+            assert release.wait(5)
+        publish(path, manifest)
+
+    def run():
+        try:
+            recover(writer.path)
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(storage, "atomic_json", pause)
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert started.wait(5)
+        with pytest.raises(RuntimeError, match="already in use"):
+            recover(writer.path)
+    finally:
+        release.set()
+        worker.join(6)
+    assert not worker.is_alive() and not errors
+
+
+def test_recovery_interruption_keeps_first_backups_and_blocks_read(tmp_path, monkeypatch):
+    writer = episode(tmp_path, capture="synthetic")
+    writer.emit("input", "KEY_DOWN", {"vk": 87})
+    writer.close("failed")
+    path = writer.path
+    (path / "frames.parquet").unlink()
+    originals = {p.name: p.read_bytes() for p in path.glob("*.parquet")}
+    journal = (path / "journal.jsonl").read_bytes()
+    replace = Path.replace
+    def interrupt(source, target):
+        if Path(target).name == "ocr.parquet":
+            raise OSError("interrupted multi-stream publication")
+        return replace(source, target)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "replace", interrupt)
+        with pytest.raises(OSError, match="interrupted"):
+            recover(path)
+    assert json.loads((path / "manifest.json").read_text(encoding="utf-8"))["status"] == "recovering"
+    with pytest.raises(RuntimeError, match="recovery"):
+        list(iter_rows(path, "input"))
+    assert recover(path)["status"] == "recovered_partial"
+    assert recover(path)["counts"]["input"] == 1
+    for name, original in originals.items():
+        backup = path / name.replace(".parquet", ".pre-recovery.parquet")
+        assert backup.read_bytes() == original
+    assert not (path / "frames.pre-recovery.parquet").exists()
+    assert (path / "journal.jsonl").read_bytes() == journal
+
+
+def test_recovery_lock_releases_when_another_process_exits(tmp_path):
+    writer = episode(tmp_path, capture="synthetic")
+    writer.close("failed")
+    child_code = (
+        "from pathlib import Path\n"
+        "from sys import argv, stdin\n"
+        "from synaeris_collector.storage import episode_exclusive\n"
+        "with episode_exclusive(Path(argv[1])):\n"
+        "    print('READY', flush=True)\n"
+        "    stdin.read()\n"
+    )
+    with subprocess.Popen([sys.executable, "-B", "-c", child_code, str(writer.path)],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
+        try:
+            assert child.stdout.readline().rstrip(b"\r\n") == b"READY"
+            with pytest.raises(RuntimeError, match="already in use"):
+                recover(writer.path)
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            result = recover(writer.path)
+            break
+        except RuntimeError as exc:
+            if "already in use" not in str(exc) or time.monotonic() >= deadline:
+                raise
+            # Windows can signal process exit before cleaning up byte locks.
+            time.sleep(.05)
+    assert result["status"] == "recovered_partial"
 
 
 def test_bridge_rejects_cross_episode_and_clock_mismatch(tmp_path):
